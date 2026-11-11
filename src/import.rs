@@ -197,7 +197,13 @@ mod tests {
         let mut db = connect_in_memory()?;
         let source = Path::new("words.csv");
         let duplicate = "word_study,word_translation,part_of_speech,gender\nHund,perro,noun,\nhund,perro,noun,\n";
-        assert!(import_reader(&mut db, Cursor::new(duplicate), source).is_err());
+        let error = import_reader(&mut db, Cursor::new(duplicate), source).unwrap_err();
+        assert!(error.to_string().contains("words.csv: line 3"));
+        assert!(
+            error
+                .to_string()
+                .contains("appears more than once in the CSV file")
+        );
         assert_eq!(
             db.query_row("SELECT COUNT(*) FROM vocabulary_entries", [], |row| row
                 .get::<_, i64>(0))?,

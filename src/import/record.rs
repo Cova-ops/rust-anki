@@ -52,7 +52,9 @@ pub(super) fn parse_record(
         return Err(line_error(
             source,
             line,
-            format!("duplicate word_study {word_study:?}; the entire import was rejected"),
+            format!(
+                "duplicate word_study {word_study:?} appears more than once in the CSV file; the entire import was rejected"
+            ),
         ));
     }
     Ok(ParsedEntry {
