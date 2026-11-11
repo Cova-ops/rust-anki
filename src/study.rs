@@ -3,9 +3,16 @@ use std::io::Write;
 use chrono::{DateTime, Local, Utc};
 use eyre::{Context, Result};
 
+use crate::audio::{Clock, Recognizer};
+use crate::listening::{self, ListenOutcome};
 use crate::review::Grade;
-use crate::speech::{self, Clock, ListenOutcome, Recognizer};
 use crate::synthesis::{self, Synthesizer};
+use crate::{answer, speech};
+
+mod prompt;
+#[cfg(test)]
+use prompt::capitalize;
+use prompt::write_prompt;
 
 /// A vocabulary entry presented during a study session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +72,7 @@ where
 {
     'entries: for entry in entries {
         let expected = expected_answer(entry);
-        if speech::normalize_tokens(&expected).is_empty() {
+        if answer::normalize_tokens(&expected).is_empty() {
             writeln!(
                 output,
                 "Skipping invalid vocabulary entry: the expected answer has no words."
@@ -80,11 +87,12 @@ where
         recognizer
             .start(speech::ANSWER_LOCALE)
             .wrap_err("failed to start speech recognition")?;
-        writeln!(output, "Listening...")?;
-        output.flush()?;
-
         let entry_clock = clock();
-        match speech::listen_with_updates(recognizer, &entry_clock, &expected, |transcript| {
+        if let Err(error) = writeln!(output, "Listening...").and_then(|()| output.flush()) {
+            recognizer.stop();
+            return Err(error.into());
+        }
+        match listening::listen_with_updates(recognizer, &entry_clock, &expected, |transcript| {
             writeln!(output, "Heard: {transcript}")?;
             output.flush()?;
             Ok(())
@@ -127,24 +135,6 @@ fn expected_answer(entry: &StudyEntry) -> String {
     match &entry.article {
         Some(article) => format!("{article} {}", entry.word_study),
         None => entry.word_study.clone(),
-    }
-}
-
-fn write_prompt<W: Write>(output: &mut W, entry: &StudyEntry) -> std::io::Result<()> {
-    writeln!(
-        output,
-        "Please translate this word: {}",
-        capitalize(&entry.word_translation)
-    )?;
-    output.flush()
-}
-
-fn capitalize(value: &str) -> String {
-    let mut characters = value.chars();
-
-    match characters.next() {
-        Some(first) => first.to_uppercase().chain(characters).collect(),
-        None => String::new(),
     }
 }
 
@@ -262,6 +252,40 @@ mod tests {
 
     fn seconds(value: u64) -> Duration {
         Duration::from_secs(value)
+    }
+
+    #[test]
+    fn output_failure_after_capture_starts_stops_recognition() {
+        struct FailingOutput(usize);
+        impl Write for FailingOutput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0 += 1;
+                if self.0 == 2 {
+                    return Err(std::io::Error::other("output failure"));
+                }
+                Ok(())
+            }
+        }
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let mut recognizer = FakeRecognizer::new(Rc::clone(&clock), vec![vec![]]);
+        let entries = [entry(1, "Hund", "perro", Some("der"))];
+        let mut grades = Vec::new();
+        let result = run(
+            &entries,
+            &mut FailingOutput(0),
+            &mut recognizer,
+            move || FakeClock(Rc::clone(&clock)),
+            |id, grade| {
+                grades.push((id, grade));
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(recognizer.stopped);
+        assert!(grades.is_empty());
     }
 
     #[test]

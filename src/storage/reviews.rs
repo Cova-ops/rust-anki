@@ -4,26 +4,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::review::{self, Grade, ReviewState};
 
-/// Number of entries presented in one study session.
-pub const SESSION_SIZE: usize = 5;
-
-const SELECT_DUE_IDS: &str = "
-SELECT vocabulary_entry_id
-FROM review_schedule
-WHERE due_at <= ?1
-ORDER BY due_at ASC, vocabulary_entry_id ASC
-LIMIT ?2
-";
-
-const SELECT_NEW_IDS: &str = "
-SELECT vocabulary_entries.id
-FROM vocabulary_entries
-LEFT JOIN review_schedule
-    ON review_schedule.vocabulary_entry_id = vocabulary_entries.id
-WHERE review_schedule.vocabulary_entry_id IS NULL
-ORDER BY vocabulary_entries.id ASC
-LIMIT ?1
-";
+mod selection;
+mod summary;
+pub use selection::{SESSION_SIZE, select_all_study_entry_ids, select_study_entry_ids};
+pub use summary::{ReviewScheduleSummary, ReviewSummary, review_summary};
 
 const SELECT_SCHEDULE: &str = "
 SELECT stability, difficulty, last_reviewed_at
@@ -46,103 +30,6 @@ ON CONFLICT (vocabulary_entry_id) DO UPDATE SET
     difficulty = excluded.difficulty,
     last_reviewed_at = excluded.last_reviewed_at
 ";
-
-/// Review counts and the current schedule for a vocabulary entry.
-pub struct ReviewSummary {
-    pub total: i64,
-    pub good: i64,
-    pub again: i64,
-    pub schedule: Option<ReviewScheduleSummary>,
-}
-
-/// Stored schedule details used when displaying a review summary.
-pub struct ReviewScheduleSummary {
-    pub due_at: DateTime<Utc>,
-    pub last_reviewed_at: DateTime<Utc>,
-    pub stability: f64,
-    pub difficulty: f64,
-    pub pending_retry: bool,
-}
-
-/// Loads review counts and the optional schedule for an entry.
-pub fn review_summary(connection: &Connection, entry_id: i32) -> Result<ReviewSummary> {
-    let (total, good, again) = connection.query_row(
-        "SELECT COUNT(*), COUNT(CASE WHEN grade = 'good' THEN 1 END), COUNT(CASE WHEN grade = 'again' THEN 1 END) FROM review_events WHERE vocabulary_entry_id = ?1",
-        [entry_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    ).wrap_err("failed to load review counts")?;
-    let schedule = connection.query_row(
-        "SELECT due_at, stability, difficulty, last_reviewed_at, pending_retry FROM review_schedule WHERE vocabulary_entry_id = ?1",
-        [entry_id], |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?, row.get::<_, String>(3)?, row.get(4)?)),
-    ).optional().wrap_err("failed to load review schedule")?
-        .map(|(due, stability, difficulty, last, pending_retry)| -> Result<_> {
-            Ok(ReviewScheduleSummary { due_at: parse_timestamp(&due)?, last_reviewed_at: parse_timestamp(&last)?, stability, difficulty, pending_retry })
-        }).transpose()?;
-    Ok(ReviewSummary {
-        total,
-        good,
-        again,
-        schedule,
-    })
-}
-
-/// Selects due entries first, oldest due date first, then never-reviewed entries.
-pub fn select_study_entry_ids(
-    connection: &Connection,
-    now: DateTime<Utc>,
-    limit: usize,
-) -> Result<Vec<i32>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-
-    let now = format_timestamp(now);
-    let mut ids = Vec::with_capacity(limit);
-
-    {
-        let mut statement = connection
-            .prepare(SELECT_DUE_IDS)
-            .wrap_err("failed to prepare the due vocabulary query")?;
-        let rows = statement
-            .query_map(params![now, limit as i64], |row| row.get::<_, i32>(0))
-            .wrap_err("failed to select due vocabulary entries")?;
-
-        for row in rows {
-            ids.push(row.wrap_err("failed to read a due vocabulary entry")?);
-        }
-    }
-
-    if ids.len() < limit {
-        let remaining = (limit - ids.len()) as i64;
-
-        let mut statement = connection
-            .prepare(SELECT_NEW_IDS)
-            .wrap_err("failed to prepare the new vocabulary query")?;
-        let rows = statement
-            .query_map([remaining], |row| row.get::<_, i32>(0))
-            .wrap_err("failed to select new vocabulary entries")?;
-
-        for row in rows {
-            ids.push(row.wrap_err("failed to read a new vocabulary entry")?);
-        }
-    }
-
-    Ok(ids)
-}
-
-/// Selects every new entry first, then every due scheduled entry.
-pub fn select_all_study_entry_ids(connection: &Connection, now: DateTime<Utc>) -> Result<Vec<i32>> {
-    let now = format_timestamp(now);
-    let mut ids = Vec::new();
-    let mut new_entries = connection.prepare(SELECT_NEW_IDS)?;
-    for row in new_entries.query_map([i64::MAX], |row| row.get(0))? {
-        ids.push(row?);
-    }
-    let mut due_entries = connection.prepare(SELECT_DUE_IDS)?;
-    for row in due_entries.query_map(params![now, i64::MAX], |row| row.get(0))? {
-        ids.push(row?);
-    }
-    Ok(ids)
-}
 
 /// Saves one review event and updates the entry's schedule in a single transaction.
 pub fn record_review(

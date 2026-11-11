@@ -5,6 +5,10 @@ use chrono::{DateTime, Utc};
 use eyre::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
+mod deletion;
+pub use crate::vocabulary::{Gender, NewVocabularyEntry, PartOfSpeech, VocabularyEntry};
+pub use deletion::delete_with_reviews;
+
 const PART_OF_SPEECH_COLUMN: usize = 3;
 const GENDER_COLUMN: usize = 4;
 const UPDATED_AT_COLUMN: usize = 5;
@@ -16,170 +20,41 @@ const INSERT_ENTRY: &str = "INSERT INTO vocabulary_entries \
      (word_study, word_translation, part_of_speech, gender) \
      VALUES (?1, ?2, ?3, ?4)";
 
-/// Grammatical category of a vocabulary entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PartOfSpeech {
-    Noun,
-    Verb,
-    Adjective,
-    Adverb,
-    Pronoun,
-    Article,
-    Preposition,
-    Conjunction,
-    Numeral,
-    Particle,
-    Interjection,
-}
-
-impl PartOfSpeech {
-    /// Returns the value stored in the database.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Noun => "noun",
-            Self::Verb => "verb",
-            Self::Adjective => "adjective",
-            Self::Adverb => "adverb",
-            Self::Pronoun => "pronoun",
-            Self::Article => "article",
-            Self::Preposition => "preposition",
-            Self::Conjunction => "conjunction",
-            Self::Numeral => "numeral",
-            Self::Particle => "particle",
-            Self::Interjection => "interjection",
-        }
-    }
-
-    /// Parses a part-of-speech label, ignoring case.
-    pub fn from_label(value: &str) -> Option<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "noun" => Some(Self::Noun),
-            "verb" => Some(Self::Verb),
-            "adjective" => Some(Self::Adjective),
-            "adverb" => Some(Self::Adverb),
-            "pronoun" => Some(Self::Pronoun),
-            "article" => Some(Self::Article),
-            "preposition" => Some(Self::Preposition),
-            "conjunction" => Some(Self::Conjunction),
-            "numeral" => Some(Self::Numeral),
-            "particle" => Some(Self::Particle),
-            "interjection" => Some(Self::Interjection),
-            _ => None,
-        }
-    }
-
-    fn from_db(value: String) -> rusqlite::Result<Self> {
-        match value.as_str() {
-            "noun" => Ok(Self::Noun),
-            "verb" => Ok(Self::Verb),
-            "adjective" => Ok(Self::Adjective),
-            "adverb" => Ok(Self::Adverb),
-            "pronoun" => Ok(Self::Pronoun),
-            "article" => Ok(Self::Article),
-            "preposition" => Ok(Self::Preposition),
-            "conjunction" => Ok(Self::Conjunction),
-            "numeral" => Ok(Self::Numeral),
-            "particle" => Ok(Self::Particle),
-            "interjection" => Ok(Self::Interjection),
-            _ => Err(conversion_error(
+fn entry_from_row(row: &Row<'_>) -> rusqlite::Result<VocabularyEntry> {
+    let id: i32 = row.get("id")?;
+    let word_study: String = row.get("word_study")?;
+    let word_translation: String = row.get("word_translation")?;
+    let part: String = row.get("part_of_speech")?;
+    let part_of_speech = PartOfSpeech::from_label(&part)
+        .filter(|part_type| part_type.as_str() == part)
+        .ok_or_else(|| {
+            conversion_error(
                 PART_OF_SPEECH_COLUMN,
-                format!("invalid part_of_speech value {value:?}"),
-            )),
-        }
-    }
-}
-
-/// Grammatical gender of a vocabulary entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Gender {
-    Male,
-    Female,
-    Neutral,
-}
-
-impl Gender {
-    /// Returns the value stored in the database.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Male => "Male",
-            Self::Female => "Female",
-            Self::Neutral => "Neutral",
-        }
-    }
-
-    /// Returns the German definite article for this gender.
-    pub const fn german_article(self) -> &'static str {
-        match self {
-            Self::Male => "der",
-            Self::Female => "die",
-            Self::Neutral => "das",
-        }
-    }
-
-    /// Parses a gender label from a CSV file, ignoring case.
-    pub fn from_csv_label(value: &str) -> Option<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "masculine" | "male" => Some(Self::Male),
-            "feminine" | "female" => Some(Self::Female),
-            "neuter" | "neutral" => Some(Self::Neutral),
-            _ => None,
-        }
-    }
-
-    fn from_db(value: String) -> rusqlite::Result<Self> {
-        match value.as_str() {
-            "Male" => Ok(Self::Male),
-            "Female" => Ok(Self::Female),
-            "Neutral" => Ok(Self::Neutral),
+                format!("invalid part_of_speech value {part:?}"),
+            )
+        })?;
+    let gender = row
+        .get::<_, Option<String>>("gender")?
+        .map(|value| match value.as_str() {
+            "Male" => Ok(Gender::Male),
+            "Female" => Ok(Gender::Female),
+            "Neutral" => Ok(Gender::Neutral),
             _ => Err(conversion_error(
                 GENDER_COLUMN,
                 format!("invalid gender value {value:?}"),
             )),
-        }
-    }
-}
-
-/// A vocabulary entry that has not been persisted yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewVocabularyEntry {
-    pub word_study: String,
-    pub word_translation: String,
-    pub part_of_speech: PartOfSpeech,
-    pub gender: Option<Gender>,
-}
-
-/// A vocabulary entry stored in the database.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VocabularyEntry {
-    pub id: i32,
-    pub word_study: String,
-    pub word_translation: String,
-    pub part_of_speech: PartOfSpeech,
-    pub gender: Option<Gender>,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl VocabularyEntry {
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
-        let id: i32 = row.get("id")?;
-        let word_study: String = row.get("word_study")?;
-        let word_translation: String = row.get("word_translation")?;
-        let part_of_speech = PartOfSpeech::from_db(row.get("part_of_speech")?)?;
-        let gender = row
-            .get::<_, Option<String>>("gender")?
-            .map(Gender::from_db)
-            .transpose()?;
-        let updated_at = parse_updated_at(row.get("updated_at")?)?;
-
-        Ok(Self {
-            id,
-            word_study,
-            word_translation,
-            part_of_speech,
-            gender,
-            updated_at,
         })
-    }
+        .transpose()?;
+    let updated_at = parse_updated_at(row.get("updated_at")?)?;
+
+    Ok(VocabularyEntry {
+        id,
+        word_study,
+        word_translation,
+        part_of_speech,
+        gender,
+        updated_at,
+    })
 }
 
 /// Inserts every entry in a single transaction.
@@ -225,40 +100,40 @@ pub fn insert_many(connection: &mut Connection, entries: &[NewVocabularyEntry]) 
 /// Fetches the vocabulary entry with `id`, if it exists.
 pub fn find_by_id(connection: &Connection, id: i32) -> Result<Option<VocabularyEntry>> {
     connection
-        .query_row(SELECT_ENTRY, [id], VocabularyEntry::from_row)
+        .query_row(SELECT_ENTRY, [id], entry_from_row)
         .optional()
         .wrap_err_with(|| format!("failed to fetch vocabulary entry {id}"))
 }
 
 /// Checks whether a study word exists, ignoring case.
 pub fn word_study_exists(connection: &Connection, word: &str) -> Result<bool> {
-    let mut statement = connection.prepare("SELECT word_study FROM vocabulary_entries")?;
-    let mut rows = statement.query([])?;
-    let target = word.to_lowercase();
-    while let Some(row) = rows.next()? {
-        let existing: String = row.get(0)?;
-        if existing.to_lowercase() == target {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    register_word_collation(connection)?;
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM vocabulary_entries WHERE word_study = ?1 COLLATE unicode_lowercase)",
+        [word], |row| row.get(0),
+    ).wrap_err("failed to check vocabulary entry")
 }
 
 /// Fetches an entry by its case-insensitive study word.
 pub fn find_by_word(connection: &Connection, word: &str) -> Result<Option<VocabularyEntry>> {
-    connection.create_collation("unicode_lowercase", |a, b| {
-        a.to_lowercase().cmp(&b.to_lowercase())
-    })?;
+    register_word_collation(connection)?;
     let mut statement = connection.prepare(
         "SELECT id, word_study, word_translation, part_of_speech, gender, updated_at FROM vocabulary_entries WHERE word_study = ?1 COLLATE unicode_lowercase LIMIT 2",
     )?;
     let mut rows = statement.query([word])?;
-    let matched = rows.next()?.map(VocabularyEntry::from_row).transpose()?;
+    let matched = rows.next()?.map(entry_from_row).transpose()?;
     eyre::ensure!(
         rows.next()?.is_none(),
         "multiple vocabulary entries match {word:?} ignoring case; cannot select one safely"
     );
     Ok(matched)
+}
+
+fn register_word_collation(connection: &Connection) -> Result<()> {
+    connection.create_collation("unicode_lowercase", |a, b| {
+        a.to_lowercase().cmp(&b.to_lowercase())
+    })?;
+    Ok(())
 }
 
 /// Updates editable fields without changing review history or scheduling.
@@ -269,26 +144,6 @@ pub fn update_editable(connection: &Connection, entry: &VocabularyEntry) -> Resu
     ).wrap_err("failed to update vocabulary entry")?;
     eyre::ensure!(changed == 1, "vocabulary entry no longer exists");
     Ok(())
-}
-
-/// Deletes a vocabulary entry and its review data atomically.
-pub fn delete_with_reviews(connection: &mut Connection, id: i32) -> Result<()> {
-    let transaction = connection
-        .transaction()
-        .wrap_err("failed to start deletion transaction")?;
-    transaction.execute(
-        "DELETE FROM review_events WHERE vocabulary_entry_id = ?1",
-        [id],
-    )?;
-    transaction.execute(
-        "DELETE FROM review_schedule WHERE vocabulary_entry_id = ?1",
-        [id],
-    )?;
-    let count = transaction.execute("DELETE FROM vocabulary_entries WHERE id = ?1", [id])?;
-    eyre::ensure!(count == 1, "vocabulary entry no longer exists");
-    transaction
-        .commit()
-        .wrap_err("failed to commit vocabulary deletion")
 }
 
 fn parse_updated_at(value: String) -> rusqlite::Result<DateTime<Utc>> {

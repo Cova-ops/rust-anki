@@ -6,7 +6,10 @@ use std::path::Path;
 use eyre::{Context, Result, eyre};
 use rusqlite::Connection;
 
-use crate::storage::vocabulary::{self, Gender, NewVocabularyEntry, PartOfSpeech};
+use crate::storage::vocabulary;
+use crate::vocabulary::NewVocabularyEntry;
+
+mod record;
 
 const HEADER: [&str; 4] = ["word_study", "word_translation", "part_of_speech", "gender"];
 
@@ -50,65 +53,7 @@ fn import_reader<R: Read>(connection: &mut Connection, reader: R, source: &Path)
 
     for record in records {
         let record = record.map_err(|error| csv_error(source, &error))?;
-        let line = record.position().map_or(0, |position| position.line());
-
-        if record.len() != HEADER.len() {
-            return Err(line_error(
-                source,
-                line,
-                format!("expected {} fields, found {}", HEADER.len(), record.len()),
-            ));
-        }
-
-        let word_study = record[0].trim();
-        let word_translation = record[1].trim();
-        let part_of_speech = record[2].trim();
-        let gender = record[3].trim();
-
-        if word_study.is_empty() {
-            return Err(line_error(source, line, "word_study must not be blank"));
-        }
-        if word_translation.is_empty() {
-            return Err(line_error(
-                source,
-                line,
-                "word_translation must not be blank",
-            ));
-        }
-
-        let part_of_speech = PartOfSpeech::from_label(part_of_speech).ok_or_else(|| {
-            line_error(
-                source,
-                line,
-                format!("invalid part_of_speech value {part_of_speech:?}"),
-            )
-        })?;
-
-        let gender = if gender.is_empty() {
-            None
-        } else {
-            Some(Gender::from_csv_label(gender).ok_or_else(|| {
-                line_error(source, line, format!("invalid gender value {gender:?}"))
-            })?)
-        };
-
-        if !seen.insert(word_study.to_lowercase()) {
-            return Err(line_error(
-                source,
-                line,
-                format!("duplicate word_study {word_study:?}; the entire import was rejected"),
-            ));
-        }
-
-        parsed_entries.push(ParsedEntry {
-            line,
-            entry: NewVocabularyEntry {
-                word_study: word_study.to_owned(),
-                word_translation: word_translation.to_owned(),
-                part_of_speech,
-                gender,
-            },
-        });
+        parsed_entries.push(record::parse_record(&record, source, &mut seen)?);
     }
 
     for parsed in &parsed_entries {
@@ -197,6 +142,7 @@ mod tests {
 
     use super::*;
     use crate::storage::connect_in_memory;
+    use crate::storage::vocabulary::{Gender, PartOfSpeech};
 
     #[test]
     fn rejects_case_insensitive_duplicates_in_file_and_database() -> Result<()> {
