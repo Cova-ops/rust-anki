@@ -230,26 +230,35 @@ pub fn find_by_id(connection: &Connection, id: i32) -> Result<Option<VocabularyE
         .wrap_err_with(|| format!("failed to fetch vocabulary entry {id}"))
 }
 
-/// Fetches an entry by its case-insensitive study word.
-pub fn find_by_word(connection: &Connection, word: &str) -> Result<Option<VocabularyEntry>> {
-    let mut statement = connection.prepare("SELECT id, word_study FROM vocabulary_entries")?;
+/// Checks whether a study word exists, ignoring case.
+pub fn word_study_exists(connection: &Connection, word: &str) -> Result<bool> {
+    let mut statement = connection.prepare("SELECT word_study FROM vocabulary_entries")?;
     let mut rows = statement.query([])?;
     let target = word.to_lowercase();
-    let mut matched_id = None;
     while let Some(row) = rows.next()? {
-        let candidate: String = row.get(1)?;
-        if candidate.to_lowercase() == target {
-            eyre::ensure!(
-                matched_id.is_none(),
-                "multiple vocabulary entries match {word:?} ignoring case; cannot select one safely"
-            );
-            matched_id = Some(row.get(0)?);
+        let existing: String = row.get(0)?;
+        if existing.to_lowercase() == target {
+            return Ok(true);
         }
     }
-    matched_id
-        .map(|id| find_by_id(connection, id))
-        .transpose()
-        .map(Option::flatten)
+    Ok(false)
+}
+
+/// Fetches an entry by its case-insensitive study word.
+pub fn find_by_word(connection: &Connection, word: &str) -> Result<Option<VocabularyEntry>> {
+    connection.create_collation("unicode_lowercase", |a, b| {
+        a.to_lowercase().cmp(&b.to_lowercase())
+    })?;
+    let mut statement = connection.prepare(
+        "SELECT id, word_study, word_translation, part_of_speech, gender, updated_at FROM vocabulary_entries WHERE word_study = ?1 COLLATE unicode_lowercase LIMIT 2",
+    )?;
+    let mut rows = statement.query([word])?;
+    let matched = rows.next()?.map(VocabularyEntry::from_row).transpose()?;
+    eyre::ensure!(
+        rows.next()?.is_none(),
+        "multiple vocabulary entries match {word:?} ignoring case; cannot select one safely"
+    );
+    Ok(matched)
 }
 
 /// Updates editable fields without changing review history or scheduling.
@@ -260,6 +269,26 @@ pub fn update_editable(connection: &Connection, entry: &VocabularyEntry) -> Resu
     ).wrap_err("failed to update vocabulary entry")?;
     eyre::ensure!(changed == 1, "vocabulary entry no longer exists");
     Ok(())
+}
+
+/// Deletes a vocabulary entry and its review data atomically.
+pub fn delete_with_reviews(connection: &mut Connection, id: i32) -> Result<()> {
+    let transaction = connection
+        .transaction()
+        .wrap_err("failed to start deletion transaction")?;
+    transaction.execute(
+        "DELETE FROM review_events WHERE vocabulary_entry_id = ?1",
+        [id],
+    )?;
+    transaction.execute(
+        "DELETE FROM review_schedule WHERE vocabulary_entry_id = ?1",
+        [id],
+    )?;
+    let count = transaction.execute("DELETE FROM vocabulary_entries WHERE id = ?1", [id])?;
+    eyre::ensure!(count == 1, "vocabulary entry no longer exists");
+    transaction
+        .commit()
+        .wrap_err("failed to commit vocabulary deletion")
 }
 
 fn parse_updated_at(value: String) -> rusqlite::Result<DateTime<Utc>> {

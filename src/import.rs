@@ -112,7 +112,7 @@ fn import_reader<R: Read>(connection: &mut Connection, reader: R, source: &Path)
     }
 
     for parsed in &parsed_entries {
-        if word_study_exists(connection, &parsed.entry.word_study)? {
+        if vocabulary::word_study_exists(connection, &parsed.entry.word_study)? {
             return Err(line_error(
                 source,
                 parsed.line,
@@ -154,25 +154,12 @@ struct ParsedEntry {
     entry: NewVocabularyEntry,
 }
 
-fn word_study_exists(connection: &Connection, word_study: &str) -> Result<bool> {
-    let mut statement = connection.prepare("SELECT word_study FROM vocabulary_entries")?;
-    let mut rows = statement.query([])?;
-    let target = word_study.to_lowercase();
-    while let Some(row) = rows.next()? {
-        let existing: String = row.get(0)?;
-        if existing.to_lowercase() == target {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 fn conflicting_word_study(
     connection: &Connection,
     entries: &[NewVocabularyEntry],
 ) -> Result<Option<String>> {
     for entry in entries {
-        if word_study_exists(connection, &entry.word_study)? {
+        if vocabulary::word_study_exists(connection, &entry.word_study)? {
             return Ok(Some(entry.word_study.clone()));
         }
     }
