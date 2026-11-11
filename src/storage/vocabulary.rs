@@ -97,6 +97,108 @@ pub fn insert_many(connection: &mut Connection, entries: &[NewVocabularyEntry]) 
         .wrap_err("failed to commit the vocabulary inserts")
 }
 
+/// Import outcome; a conflict rolls back every new entry in the batch.
+pub enum ImportOutcome {
+    Inserted(usize),
+    Conflict {
+        index: usize,
+        existing: VocabularyEntry,
+    },
+}
+
+/// A preflighted import action, with the original row used for concurrency checks.
+pub enum ImportAction {
+    Insert(NewVocabularyEntry),
+    Replace {
+        incoming: NewVocabularyEntry,
+        original: VocabularyEntry,
+    },
+}
+
+/// Applies preflighted imports atomically without holding a lock while prompting.
+pub fn apply_import(connection: &mut Connection, actions: &[ImportAction]) -> Result<usize> {
+    register_word_collation(connection)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut inserted = 0;
+    for action in actions {
+        match action {
+            ImportAction::Insert(entry) => {
+                eyre::ensure!(
+                    find_by_word(&transaction, &entry.word_study)?.is_none(),
+                    "vocabulary changed during import; please retry"
+                );
+                transaction.execute(
+                    INSERT_ENTRY,
+                    params![
+                        entry.word_study,
+                        entry.word_translation,
+                        entry.part_of_speech.as_str(),
+                        entry.gender.map(Gender::as_str)
+                    ],
+                )?;
+                inserted += 1;
+            }
+            ImportAction::Replace { incoming, original } => {
+                let current = find_by_word(&transaction, &original.word_study)?;
+                eyre::ensure!(
+                    current.as_ref() == Some(original),
+                    "vocabulary changed during import; please retry"
+                );
+                let count = transaction.execute(
+                    "UPDATE vocabulary_entries SET word_study = ?1, word_translation = ?2, part_of_speech = ?3, gender = ?4, updated_at = ?5 WHERE id = ?6",
+                    params![incoming.word_study, incoming.word_translation, incoming.part_of_speech.as_str(), incoming.gender.map(Gender::as_str), Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true), original.id],
+                )?;
+                eyre::ensure!(count == 1, "vocabulary changed during import; please retry");
+            }
+        }
+    }
+    transaction
+        .commit()
+        .wrap_err("failed to commit the vocabulary import")?;
+    Ok(inserted)
+}
+
+/// Inserts new entries and skips exact duplicates in one write transaction.
+pub fn insert_skipping_identical(
+    connection: &mut Connection,
+    entries: &[NewVocabularyEntry],
+) -> Result<ImportOutcome> {
+    register_word_collation(connection)?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .wrap_err("failed to start the vocabulary import transaction")?;
+    let mut count = 0;
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(existing) = find_by_word(&transaction, &entry.word_study)? {
+            if existing.word_study == entry.word_study
+                && existing.word_translation == entry.word_translation
+                && existing.part_of_speech == entry.part_of_speech
+                && existing.gender == entry.gender
+            {
+                continue;
+            }
+            return Ok(ImportOutcome::Conflict { index, existing });
+        }
+        transaction
+            .execute(
+                INSERT_ENTRY,
+                params![
+                    entry.word_study,
+                    entry.word_translation,
+                    entry.part_of_speech.as_str(),
+                    entry.gender.map(Gender::as_str)
+                ],
+            )
+            .wrap_err_with(|| format!("failed to insert word {:?}", entry.word_study))?;
+        count += 1;
+    }
+    transaction
+        .commit()
+        .wrap_err("failed to commit the vocabulary import")?;
+    Ok(ImportOutcome::Inserted(count))
+}
+
 /// Fetches the vocabulary entry with `id`, if it exists.
 pub fn find_by_id(connection: &Connection, id: i32) -> Result<Option<VocabularyEntry>> {
     connection

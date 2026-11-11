@@ -18,10 +18,12 @@ status: review
   lesen,leer,verb,
   ```
 - Reject missing or unreadable files, incorrect headers, malformed records, blank words or translations, and invalid `part_of_speech` or `gender` values. Include the file path and, when available, the record or line number in the error.
-- Reject duplicate `word_study` values within the CSV or already present in `vocabulary_entries`, comparing case-insensitively using Unicode lowercase after trimming CSV fields. Report the conflicting word and explain that the entire import was rejected. Recheck inside the write transaction to prevent concurrent uploads from introducing duplicates.
+- Reject duplicate `word_study` values within the CSV, comparing case-insensitively using Unicode lowercase after trimming CSV fields. Silently skip an existing entry when all parsed fields exactly match.
+- For a differing existing entry, show a side-by-side comparison and require an explicit `r` (replace) or `o` (omit); Enter has no default. Replacing uses the CSV fields, updates `updated_at`, and preserves the existing entry ID, review events and schedule. Omitted entries are unchanged.
+- Apply all selected changes in one transaction after the prompts. If input ends or the data changes before saving, do not partially import.
 - Add a new migration that creates a unique index on `vocabulary_entries.word_study`. If an existing database contains duplicates, fail the migration with a diagnostic so the user can resolve them.
 - Validate the CSV before writing. Use the existing bulk insert operation to save the vocabulary in a single transaction. If any insert fails, roll back the entire import. Treat a uniqueness violation during insertion as a duplicate error even if the earlier validation passed.
-- On success, report how many entries were imported.
+- On success, report how many entries were imported, replaced, and omitted. The omitted count includes identical entries skipped automatically and entries explicitly omitted by the user.
 
 ### Tests
 

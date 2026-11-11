@@ -15,8 +15,18 @@ pub fn run(cli: Cli, connection: &mut Connection) -> Result<()> {
         Command::Upload {
             target: UploadTarget::Vocabulary { csv_path },
         } => {
-            let imported = import::import_vocabulary(connection, &csv_path)?;
-            println!("Imported {imported} vocabulary entries.");
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            let mut input = stdin.lock();
+            let mut output = stdout.lock();
+            let summary =
+                import::import_vocabulary_with_resolver(connection, &csv_path, |duplicate| {
+                    resolve_duplicate(&mut input, &mut output, duplicate)
+                })?;
+            drop(output);
+            println!("Imported {} vocabulary entries.", summary.imported);
+            println!("Replaced {} vocabulary entries.", summary.replaced);
+            println!("Omitted {} vocabulary entries.", summary.omitted);
             Ok(())
         }
         Command::Study {
@@ -49,6 +59,28 @@ pub fn run(cli: Cli, connection: &mut Connection) -> Result<()> {
     }
 }
 
+fn resolve_duplicate(
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+    duplicate: &import::DuplicateVocabulary,
+) -> Result<import::DuplicateDecision> {
+    output::write_duplicate_comparison(output, duplicate)?;
+    loop {
+        write!(output, "Replace or omit? [r/o] ")?;
+        output.flush()?;
+        let mut line = String::new();
+        eyre::ensure!(
+            input.read_line(&mut line)? != 0,
+            "input ended; no changes were saved"
+        );
+        match line.trim().to_ascii_lowercase().as_str() {
+            "r" => return Ok(import::DuplicateDecision::Replace),
+            "o" => return Ok(import::DuplicateDecision::Omit),
+            _ => writeln!(output, "Please enter r or o.")?,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::storage::{reviews, vocabulary};
@@ -57,6 +89,39 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn duplicate_prompt_requires_explicit_choice() -> Result<()> {
+        let duplicate = import::DuplicateVocabulary {
+            source: "test.csv".into(),
+            line: 2,
+            incoming: crate::vocabulary::NewVocabularyEntry {
+                word_study: "Hund".into(),
+                word_translation: "can".into(),
+                part_of_speech: crate::vocabulary::PartOfSpeech::Noun,
+                gender: None,
+            },
+            existing: crate::vocabulary::VocabularyEntry {
+                id: 1,
+                word_study: "Hund".into(),
+                word_translation: "perro".into(),
+                part_of_speech: crate::vocabulary::PartOfSpeech::Noun,
+                gender: None,
+                updated_at: Utc::now(),
+            },
+        };
+        let mut output = Vec::new();
+        let decision = resolve_duplicate(
+            &mut std::io::Cursor::new(b"\ninvalid\nr\n"),
+            &mut output,
+            &duplicate,
+        )?;
+        assert!(matches!(decision, import::DuplicateDecision::Replace));
+        let text = String::from_utf8(output)?;
+        assert_eq!(text.matches("Replace or omit? [r/o]").count(), 3);
+        assert_eq!(text.matches("Please enter r or o.").count(), 2);
+        Ok(())
+    }
 
     #[test]
     fn deletion_requires_confirmation_and_removes_only_selected_reviews() -> Result<()> {
